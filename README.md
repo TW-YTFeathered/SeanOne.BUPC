@@ -1,93 +1,142 @@
 # BUPC Codec
 
-A simple entropy encoding/decoding implementation in C#. The `BUPCCodec` class builds a custom prefix code tree (fishbone‑shaped) based on symbol frequency, then compresses byte arrays accordingly.
+A C# entropy encoding/decoding library that builds a **near‑optimal prefix code tree** using dynamic programming and a “fishbone” shape.  
+The codec optionally serialises the tree together with the compressed data, making it self‑contained.
 
-## Overview
+## Features
 
-- **Encoding**  
-  - Analyzes input data to compute symbol frequencies.  
-  - Sorts symbols by descending frequency.  
-  - Splits the sorted list into left and right halves (balanced by count).  
-  - For each half, builds a “fishbone” tree – a degenerate binary tree where one branch always points to a leaf symbol and the other continues the spine.  
-  - Traverses the combined virtual root (`LeftSubtree` + `RightSubtree`) to generate binary codes for each byte.  
-  - Writes the original data length (4 bytes, little‑endian) followed by the packed bit stream (MSB first).
+- **Optimal tree construction** – recursive DP chooses the best split points to minimise weighted path length.
+- **Fishbone subtrees** – simple degenerate binary trees used when splitting is no longer beneficial.
+- **Self‑contained compression** – `EncodingWithTree` / `DecodingWithTree` store the code tree inside the output.
+- **Separate tree mode** – share a single `BUPCCodec` instance between encoder and decoder for compact streams.
+- **MIT licensed** – free to use in commercial and open‑source projects.
 
-- **Decoding**  
-  - Reads the original length from the header.  
-  - Reuses the same tree structure (no tree data stored in the compressed output – the decoder must know or reconstruct the tree!)  
-  - Walks the tree bit by bit until a leaf symbol is reached, then repeats from the root.
+## Algorithm Overview
 
-> ⚠️ **Important**  
-> The compressed data produced by `Encode()` does **not** contain the code tree itself.  
-> To correctly decode, you must use the same `BUPCCodec` instance (i.e. the same tree) that was used for encoding.  
-> In practice this means you need to store or transmit the tree separately, or ensure the sender and receiver agree on the tree building rules.
+1. **Frequency analysis** – count occurrence of each byte value.
+2. **Sorting** – symbols are ordered by descending frequency.
+3. **Dynamic programming** – for each interval `[start, end)` the algorithm compares:
+   - Building a simple fishbone tree (depth‑penalty known in closed form).
+   - Splitting at some point `k` into two subtrees (`start..k` and `k..end`).
+   - The cost is the weighted sum of code lengths.  
+   The optimal split (or decision to use a fishbone) is stored.
+4. **Tree reconstruction** – the DP tables are used to build a binary tree where leaves hold symbols.
+5. **Code generation** – standard tree traversal assigns `0` for left, `1` for right.
+6. **Bit packing** – codes are written MSB first into a byte stream, prefixed by the original data length.
 
 ## Usage
+
+### Mode 1 – Separate Tree (Encoder/Decoder share same codec instance)
 
 ```csharp
 using SeanOne.BUPC;
 
-// Original data
 byte[] original = System.Text.Encoding.UTF8.GetBytes("hello world");
 
-// Create codec based on the data (tree = f(symbol frequencies))
+// Build optimal codec from data
 BUPCCodec codec = BUPCCodec.Create(original);
 
-// Encode
+// Encode (tree not stored in output)
 byte[] compressed = codec.Encode(original);
 
-// Decode (using the same codec instance)
+// Decode – requires the exact same codec instance
 byte[] decompressed = codec.Decode(compressed);
 ```
 
-### Important Notes
+### Mode 2 – Self‑contained (Tree + data in one array)
 
-- If the input is `null` or empty, `Encode()` returns an empty array and `Decode()` returns an empty array (provided the header indicates length 0).
-- The decoder expects the header to contain the **original uncompressed length** as a 32‑bit integer (little‑endian) in the first 4 bytes.
-- The codec is stateless after creation, but the tree structure is fixed for a given codec instance. Re‑creating a codec with the same data produces an identical tree because the symbol sorting and splitting are deterministic.
+```csharp
+// Encode with embedded tree
+byte[] selfContained = BUPCCodec.EncodingWithTree(original);
 
-## Algorithm Details
+// Decode – tree is reconstructed automatically
+byte[] decompressed = BUPCCodec.DecodingWithTree(selfContained);
+```
 
-### Tree Construction
+### Mode 3 – Load a previously serialised tree
 
-1. **Group and sort** – `data.GroupBy(x => x).OrderByDescending(g => g.Count())` → most frequent symbols first.
-2. **Split** – `mid = (symbols.Count + 1) / 2`  
-   - Left part: first `mid` symbols  
-   - Right part: remaining symbols
-3. **Build fishbone tree** for each part (parameter `growLeft` controls the direction of spine growth)  
-   - For a list of `n` symbols, the tree is a chain of internal nodes with leaf symbols attached alternately.  
-   - Example with `growLeft = true` (left child = next spine, right child = leaf symbol).
-4. **Virtual root** – combines `LeftSubtree` and `RightSubtree` as its left and right children.
-
-### Bit Packing
-
-- Bits are written in **MSB first** order inside each byte.  
-- The first bit of the first code goes to bit 7 of the first compressed data byte (offset 4).  
-- Unused trailing bits are simply ignored (they remain zero).
-
-## Limitations
-
-- The codec does **not** handle tree serialization – you must preserve the `BUPCCodec` instance or rebuild it from the same original data.
-- Not optimized for very large symbol alphabets (maximum 256 distinct bytes) – the current fishbone tree building is `O(n)` per half.
-- No error detection or recovery – if the bit stream is corrupted or the wrong tree is used, decoding will produce garbage.
+```csharp
+// Suppose you stored 'serializedTree' from somewhere
+byte[] serializedTree = ...; // raw tree bytes (preorder format)
+BUPCCodec? codec = BUPCCodec.CreateWithTree(serializedTree);
+if (codec != null)
+{
+    byte[] decoded = codec.Decode(compressedData);
+}
+```
 
 ## API Reference
 
 ### `public static BUPCCodec Create(byte[] data)`
 
-Creates a codec whose tree is derived from the frequency distribution of `data`.  
-Returns an empty codec (both subtrees `null`) if `data` is `null` or empty.
+Builds an optimal codec based on the frequency distribution of `data`.  
+Returns a valid codec even for `null` or empty input (tree becomes `null`).
 
 ### `public byte[] Encode(byte[] data)`
 
-Compresses `data` using the tree.  
-Returns an array with a 4‑byte length header followed by the packed bits, or an empty array if input is `null`/empty.
+Compresses `data` using the codec’s internal tree.  
+Output format: `[original length (4 bytes, little‑endian)] [packed bits]`.  
+Returns an empty array if input is empty or the tree is missing.
 
 ### `public byte[] Decode(byte[] compressed)`
 
-Decompresses the given packed data using the same tree.  
-Returns the original byte array, or an empty array if the header indicates length 0 or input is invalid.
+Decompresses data produced by `Encode`.  
+Requires that the tree inside the codec matches the one used for encoding.
+
+### `public static byte[] EncodingWithTree(byte[] data)`
+
+Combined encoding: calls `Create(data)` internally, then serialises the tree and appends the compressed data.  
+Output format:  
+`[tree length (4 bytes)] [tree data (preorder)] [compressed data (original length + bits)]`
+
+### `public static byte[] DecodingWithTree(byte[] combined)`
+
+Decodes data produced by `EncodingWithTree`.  
+Extracts the tree, reconstructs the codec, and decodes the remainder.
+
+### `public static BUPCCodec? CreateWithTree(byte[] serializedTree)`
+
+Reconstructs a codec from a previously serialised tree (obtained via `SerializeTree` – note that `SerializeTree` is a private helper, but the format is used internally by `EncodingWithTree`). Useful when you want to store only the tree and later reuse it for decoding multiple streams.
+
+## Serialisation Format (Tree)
+
+- **Preorder traversal**  
+  - `0x00` : internal node → then recursively left subtree, then right subtree.  
+  - `0x01` : leaf node → followed by one byte (the symbol value).  
+
+This format is used inside `EncodingWithTree` and is recognised by `DecodingWithTree` and `CreateWithTree`.
+
+## Dynamic Programming Details
+
+The algorithm works on the sorted frequency list `w[0..n-1]` (descending).  
+For a sub‑interval `[l, r)` (exclusive right bound), the total weight `W = sum(w[l..r-1])`.
+
+- **Fishbone cost** – a tree where symbols are attached along a “spine”:
+  - First `(r-l-2)` symbols have depths 1, 2, …, `(r-l-2)`.
+  - Last two symbols share depth `(r-l-1)`.
+  - Closed‑form computation without building the tree.
+
+- **Split cost** – choose a split point `k`, then `cost(l,k) + cost(k,r) + W`.
+
+The DP chooses the smaller cost. The `dpIsFishbone` flag remembers whether the interval should be a fishbone; `dpSplit` stores the best split point otherwise.
+
+Complexity: O(n³) worst‑case, but for n ≤ 256 (byte alphabet) it is fast enough for practical use.
+
+## Limitations
+
+- The alphabet is limited to 256 distinct byte values.
+- The DP does not guarantee a globally optimal Huffman tree (the fishbone restriction is intentional, trading some compression ratio for simpler decoding).
+- The codec is **not thread‑safe** for concurrent encoding/decoding (no shared mutable state, but creating multiple instances is fine).
+- `Decode` does not validate that the bit stream length matches the original length – it stops when enough symbols have been decoded. Corrupted input may produce shorter or longer output.
+
+## Bit Packing Details
+
+- Bits are packed **MSB first** inside each byte.
+- The first code bit goes into the highest bit (bit 7) of the first compressed data byte (offset 4 from the start).
+- Unused bits at the end are left as zero and ignored during decoding.
 
 ## License
 
-MIT License
+This project is licensed under the **MIT License**.  
+You are free to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software.  
+See the [LICENSE](LICENSE) file for details (or include the standard MIT notice in your distribution).
