@@ -32,10 +32,7 @@ namespace SeanOne.BUPC
         /// </summary>
         public static BUPCCodec Create(byte[] data)
         {
-            if (data == null || data.Length == 0)
-            {
-                return new BUPCCodec { _root = null };
-            }
+            if (data == null || data.Length == 0) return new BUPCCodec { _root = null }; 
 
             // Count frequencies and sort in descending order
             var freq = data.GroupBy(b => b)
@@ -77,6 +74,37 @@ namespace SeanOne.BUPC
                 _dpCost = dpCost,
                 _dpSplit = dpSplit,
                 _dpIsFishbone = dpIsFishbone
+            };
+        }
+
+        public static BUPCCodec? CreateWithTree(byte[] tree)
+        {
+            if (tree == null || tree.Length == 0) return new BUPCCodec { _root = null };
+
+            // Read the length of the serialized tree data
+            int treeLen = BitConverter.ToInt32(tree, 0);
+            if (tree.Length < 4 + treeLen) return new BUPCCodec { _root = null };
+
+            // Extracting tree data
+            byte[] treeData = new byte[treeLen];
+            Array.Copy(tree, 4, treeData, 0, treeLen);
+
+            // Deserialization tree structure
+            int pos = 0;
+            Node root = DeserializeTree(treeData, ref pos);
+            if (root == null || pos != treeLen)
+                return null;
+
+            // Create a BUPCCodec instance and set unnecessary fields to default values.
+            return new BUPCCodec
+            {
+                _root = root,
+                _symbols = Array.Empty<byte>(),
+                _weights = Array.Empty<int>(),
+                _prefixSum = Array.Empty<long>(),
+                _dpCost = new long[0, 0],
+                _dpSplit = new int[0, 0],
+                _dpIsFishbone = new bool[0, 0]
             };
         }
 
@@ -210,6 +238,59 @@ namespace SeanOne.BUPC
 
         #endregion
 
+        #region Serialization / Deserialization Tree Structure
+
+        private static byte[] SerializeTree(Node root)
+        {
+            List<byte> buffer = new List<byte>();
+            SerializeNode(root, buffer);
+            return buffer.ToArray();
+        }
+
+        private static void SerializeNode(Node node, List<byte> buffer)
+        {
+            if (node == null) return;
+
+            if (node.Symbol.HasValue)
+            {
+                // Leaf node: Marked with 0x01 followed by a symbol value
+                buffer.Add(0x01);
+                buffer.Add(node.Symbol.Value);
+            }
+            else
+            {
+                // Internal node: Mark 0x00, then recursively process the left and right subtrees.
+                buffer.Add(0x00);
+                SerializeNode(node.Left, buffer);
+                SerializeNode(node.Right, buffer);
+            }
+        }
+
+        // Deserialized tree (preorder: 0x00 internal nodes, 0x01 leaf nodes + symbols)
+        private static Node DeserializeTree(byte[] data, ref int pos)
+        {
+            if (pos >= data.Length) return null;
+
+            byte tag = data[pos++];
+            if (tag == 0x01) // leaf
+            {
+                if (pos >= data.Length) return null;
+                byte symbol = data[pos++];
+                return new Node { Symbol = symbol };
+            }
+            else if (tag == 0x00) // Internal nodes
+            {
+                Node left = DeserializeTree(data, ref pos);
+                Node right = DeserializeTree(data, ref pos);
+                return new Node { Left = left, Right = right };
+            }
+            else
+                // Invalid mark
+                return null;
+        }
+
+        #endregion
+
         #region Encoding / Decoding
 
         public byte[] Encode(byte[] data)
@@ -240,6 +321,29 @@ namespace SeanOne.BUPC
                 }
             }
             return compressed;
+        }
+
+        public static byte[] EncodingWithTree(byte[] data)
+        {
+            if (data == null || data.Length == 0) return Array.Empty<byte>();
+
+            // Build the best encoder
+            var codec = Create(data);
+
+            // Obtain the compressed data (which already contains the original length of 4 bytes).
+            byte[] compressedData = codec.Encode(data);
+
+            // Serialization tree structure
+            byte[] serializedTree = SerializeTree(codec._root);
+
+            // Combined output: Tree length (4) + Tree data + Compressed data
+            byte[] result = new byte[4 + serializedTree.Length + compressedData.Length];
+            byte[] treeLenBytes = BitConverter.GetBytes(serializedTree.Length);
+            Array.Copy(treeLenBytes, 0, result, 0, 4);
+            Array.Copy(serializedTree, 0, result, 4, serializedTree.Length);
+            Array.Copy(compressedData, 0, result, 4 + serializedTree.Length, compressedData.Length);
+
+            return result;
         }
 
         public byte[] Decode(byte[] compressed)
@@ -279,6 +383,33 @@ namespace SeanOne.BUPC
                 bitPos++;
             }
             return result;
+        }
+
+        public static byte[] DecodingWithTree(byte[] compressed)
+        {
+            if (compressed == null || compressed.Length < 4) return Array.Empty<byte>();
+
+            // Read the length of the serialized tree data
+            int treeLen = BitConverter.ToInt32(compressed, 0);
+            if (compressed.Length < 4 + treeLen) return Array.Empty<byte>();
+
+            // Extracting tree data
+            byte[] treeData = new byte[treeLen];
+            Array.Copy(compressed, 4, treeData, 0, treeLen);
+
+            // Deserialization tree structure
+            int pos = 0;
+            Node root = DeserializeTree(treeData, ref pos);
+
+            // Create a codec instance (for decoding only, no DP table required).
+            var codec = new BUPCCodec { _root = root };
+
+            // The remaining data is the compressed content (which already contains the original length of 4 bytes).
+            byte[] compressedData = new byte[compressed.Length - 4 - treeLen];
+            Array.Copy(compressed, 4 + treeLen, compressedData, 0, compressedData.Length);
+
+            // Decode
+            return codec.Decode(compressedData);
         }
 
         private Dictionary<byte, string> BuildEncodingTable()
